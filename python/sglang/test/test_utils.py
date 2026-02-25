@@ -450,7 +450,7 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        backend = RuntimeEndpoint(f"http://{args.host}:{args.port}")
     elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
