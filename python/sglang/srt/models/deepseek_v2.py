@@ -1118,6 +1118,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # cp reuse the attn_tp comm group but need to duplicate the weights
         if self.nsa_enable_prefill_cp and self.use_nsa:
             self.cp_size = get_attention_cp_size()
+            attn_tp_rank = 0
+            attn_tp_size = 1
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
