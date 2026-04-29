@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -537,3 +538,147 @@ class DeepSeekMxfp4MoEMethod:
 
         return StandardCombineInput(hidden_states=output)
 
+
+class DeepSeekH20Mxfp4HummingMoEMethod(DeepSeekMxfp4MoEMethod):
+    """DeepSeekV4 2604 FP4 routed experts on Hopper/H20 with Humming W4A8."""
+
+    @staticmethod
+    def _fp4_shape_k(weight: torch.Tensor) -> int:
+        if weight.dtype == torch.int32:
+            return weight.shape[2] * 8
+        if weight.dtype in (torch.int8, torch.uint8):
+            return weight.shape[2] * 2
+        raise TypeError(
+            f"Unsupported DeepSeekV4 FP4 expert weight dtype: {weight.dtype}"
+        )
+
+    @staticmethod
+    def _as_humming_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
+        weight = weight.contiguous()
+        if weight.dtype == torch.int32:
+            return weight
+        if weight.dtype in (torch.int8, torch.uint8):
+            return weight.view(torch.int32)
+        raise TypeError(
+            f"Unsupported DeepSeekV4 FP4 expert weight dtype: {weight.dtype}"
+        )
+
+    @staticmethod
+    def _as_humming_e8m0_scale(scale: torch.Tensor) -> torch.Tensor:
+        scale = scale.contiguous()
+        if scale.dtype == torch.float8_e8m0fnu:
+            return scale
+        return scale.to(torch.float8_e8m0fnu)
+
+    def create_moe_runner(self, layer, moe_runner_config):
+        super().create_moe_runner(layer, moe_runner_config)
+
+        from sglang.srt.layers.moe.moe_runner import MoeRunner
+
+        moe_runner_config = dataclasses.replace(moe_runner_config, layer=layer)
+        self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.humming import assert_humming_available
+
+        assert_humming_available()
+
+        from humming import dtypes
+        from humming.layer import HummingMethod
+        from humming.schema import HummingInputSchema, HummingWeightSchema
+
+        if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+            raise RuntimeError(
+                "DeepSeekV4 MXFP4 Humming backend is incompatible with "
+                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE."
+            )
+
+        self._fp8.process_weights_after_loading(layer)
+
+        w13_shape_n = layer.w13_weight.shape[1]
+        w13_shape_k = self._fp4_shape_k(layer.w13_weight)
+        w2_shape_n = layer.w2_weight.shape[1]
+        w2_shape_k = self._fp4_shape_k(layer.w2_weight)
+
+        layer.w13_weight = Parameter(
+            self._as_humming_fp4_weight(layer.w13_weight.data),
+            requires_grad=False,
+        )
+        layer.w2_weight = Parameter(
+            self._as_humming_fp4_weight(layer.w2_weight.data),
+            requires_grad=False,
+        )
+
+        layer.w13_weight_scale_inv = Parameter(
+            self._as_humming_e8m0_scale(layer.w13_weight_scale_inv.data),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale_inv = Parameter(
+            self._as_humming_e8m0_scale(layer.w2_weight_scale_inv.data),
+            requires_grad=False,
+        )
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w2_weight_scale_inv.format_ue8m0 = True
+
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale_inv.data,
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale_inv.data,
+            requires_grad=False,
+        )
+
+        layer.param_dtype = self.moe_runner_config.params_dtype
+        layer.intermediate_size = layer.intermediate_size_per_partition
+        if not hasattr(layer, "locks") or layer.locks is None:
+            layer.register_buffer(
+                "locks",
+                torch.zeros(1024, dtype=torch.int32, device=layer.w13_weight.device),
+                persistent=False,
+            )
+        elif layer.locks.device != layer.w13_weight.device:
+            layer.locks = layer.locks.to(layer.w13_weight.device)
+
+        input_schema = HummingInputSchema(a_dtype=dtypes.float8e4m3)
+        weight_schema = HummingWeightSchema(
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+        )
+        for sublayer_name, shape_n, shape_k in (
+            ("w13", w13_shape_n, w13_shape_k),
+            ("w2", w2_shape_n, w2_shape_k),
+        ):
+            HummingMethod.prepare_layer_meta(
+                layer=layer,
+                shape_n=shape_n,
+                shape_k=shape_k,
+                pad_n_to_multiple=256,
+                pad_k_to_multiple=128,
+                input_schema=input_schema,
+                weight_schema=weight_schema,
+                has_bias=False,
+                num_experts=layer.num_local_experts,
+                torch_dtype=layer.param_dtype,
+                sublayer_name=sublayer_name,
+            )
+            HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
+
+        layer._dsv4_mxfp4_backend = "humming"
+        torch.cuda.empty_cache()
+
+    def apply(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
+
+        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
+            self._gemm1_clamp_limit_tensor is not None
+        ):
+            deepseek_v4_moe_code_path_checker.observed += 1
+
+        quant_info = HummingMoeQuantInfo()
+        return self.runner.run(dispatch_output, quant_info=quant_info)

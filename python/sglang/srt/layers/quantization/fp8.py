@@ -186,18 +186,25 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
+            moe_runner_backend = get_moe_runner_backend()
             if (
                 envs.SGLANG_DSV4_MODE.get() == "2604"
                 and envs.SGLANG_DSV4_FP4_EXPERTS.get()
                 and (
-                    get_moe_runner_backend().is_flashinfer_mxfp4()
-                    or get_moe_runner_backend().is_marlin()
+                    moe_runner_backend.is_flashinfer_mxfp4()
+                    or moe_runner_backend.is_marlin()
+                    or moe_runner_backend.is_humming()
                 )
             ):
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
+                    DeepSeekH20Mxfp4HummingMoEMethod,
                     DeepSeekMxfp4MoEMethod,
                 )
 
+                if moe_runner_backend.is_humming():
+                    return DeepSeekH20Mxfp4HummingMoEMethod(
+                        fp8_method, prefix=prefix
+                    )
                 return DeepSeekMxfp4MoEMethod(fp8_method, prefix=prefix)
             return fp8_method
         elif isinstance(layer, RadixAttention):
@@ -932,8 +939,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert:
-                # FP4 experts support three MoE backends:
+                # FP4 experts support MoE backends:
                 # - marlin (Hopper w4a16): only needs int8 view
+                # - humming (Hopper/H20 w4a8): int8 view + Humming layout transform
                 # - flashinfer_mxfp4: only needs int8 view
                 # - deepgemm/auto (Blackwell): int8 view + mega_moe or scale conversion
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)

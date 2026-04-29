@@ -1381,3 +1381,145 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
         NUM_STAGE=NUM_STAGES,
     )
     return output
+
+
+@triton.jit
+def _fp8_per_token_quant_to_per_tensor_quant_kernel(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    x_scale_stride2,
+    masked_m_ptr,
+    output_scale_ptr,
+    output_ptr,
+    m,
+    k,
+    K_SCALE_BLOCK_SIZE: tl.constexpr,
+    K_BLOCK_SIZE: tl.constexpr,
+):
+    pid_k, pid_m, pid_e = (
+        tl.program_id(axis=0),
+        tl.program_id(axis=1),
+        tl.program_id(axis=2),
+    )
+    pid_m_dim = tl.num_programs(1)
+
+    token_id = pid_m
+    last_effective_id = tl.load(masked_m_ptr + pid_e)
+
+    if token_id >= last_effective_id:
+        return
+    output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
+    k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
+
+    x_ptrs = x_ptr + pid_e * m * k + k_offsets
+    output_ptrs = output_ptr + pid_e * m * k + k_offsets
+    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+
+    for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
+        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
+        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        hidden = hidden * scale_fp32 * output_scale_val_inv
+        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+
+
+def fp8_per_token_to_per_tensor_quant_triton(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    output_scale: torch.Tensor,
+    output: torch.Tensor,
+):
+    K_SCALE_BLOCK_SIZE = 128
+    assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    assert output_scale.numel() == 1
+
+    K_BLOCK_SIZE = 1024
+    assert x.size(2) % K_BLOCK_SIZE == 0
+    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
+        x,
+        x_scale,
+        *x_scale.stride(),
+        masked_m,
+        output_scale,
+        output,
+        x.size(1),
+        x.size(2),
+        K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        num_warps=8,
+    )
+
+
+def moe_permute(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sgl_kernel import moe_permute_prepare
+
+    expert_offsets, src2dst = moe_permute_prepare(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+    )
+    output_shape = (topk_ids.nelement(), inputs.size(-1))
+    if outputs is None:
+        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
+
+    assert outputs.shape == output_shape
+    assert outputs.dtype == inputs.dtype
+    assert outputs.device == inputs.device
+
+    deepep_permute_triton_kernel[(inputs.shape[0],)](
+        inputs,
+        outputs,
+        src2dst,
+        topk_ids,
+        None,
+        topk_ids.size(1),
+        inputs.size(1),
+        BLOCK_SIZE=512,
+    )
+
+    return outputs, src2dst, expert_offsets
+
+
+def moe_unpermute(
+    inputs: torch.Tensor,
+    src2dst: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    outputs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    num_tokens = topk_ids.size(0)
+    output_shape = (num_tokens, inputs.size(1))
+    if outputs is None:
+        outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
+
+    assert outputs.shape == output_shape
+    assert outputs.dtype == inputs.dtype
+    assert outputs.device == inputs.device
+
+    deepep_post_reorder_triton_kernel[(num_tokens,)](
+        inputs,
+        outputs,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        topk_ids.size(1),
+        inputs.size(1),
+        BLOCK_SIZE=512,
+    )
+
+    assert outputs is not None
+    return outputs

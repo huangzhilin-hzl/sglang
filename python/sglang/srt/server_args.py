@@ -112,6 +112,7 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark_int4fp8_moe",
+    "humming",
 ]
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
@@ -182,6 +183,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "cutlass",
     "marlin",
+    "humming",
 ]
 
 MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"]
@@ -1352,6 +1354,29 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
+            quant_method = get_quantization_config(hf_config)
+            is_dsv4_2604_fp4_experts = (
+                envs.SGLANG_DSV4_MODE.get() == "2604"
+                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            )
+            if self.quantization is None and (
+                quant_method is not None or is_dsv4_2604_fp4_experts
+            ):
+                self.quantization = quant_method or "fp8"
+
+            if (
+                is_dsv4_2604_fp4_experts
+                and self.moe_runner_backend == "auto"
+                and is_cuda()
+            ):
+                device_name = get_device_name().upper()
+                if "H20" in device_name and "H200" not in device_name:
+                    self.moe_runner_backend = "humming"
+                    logger.info(
+                        "Use humming as MoE runner backend on H20 for "
+                        "DeepseekV4 FP4 experts."
+                    )
+
             if self.enable_nsa_prefill_context_parallel:
                 if self.nsa_prefill_cp_mode == "round-robin-split":
                     self.moe_dense_tp_size = 1
