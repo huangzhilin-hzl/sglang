@@ -100,6 +100,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     log_info_on_rank0,
     make_layers,
 )
@@ -315,6 +316,15 @@ class MQALayer(nn.Module):
                 prefix=add_prefix("wkv", prefix),
             )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        # When CP mode sets tp_size=1 (repeat weights), decode can slice
+        # to compute only local heads/groups matching normal TP behavior.
+        disable_decode_slice = get_bool_env_var("SGLANG_CP_DISABLE_DECODE_SLICE")
+        if self.nsa_enable_prefill_cp and not disable_decode_slice:
+            decode_tp_rank = get_attention_cp_rank()
+            decode_tp_size = get_attention_cp_size()
+        else:
+            decode_tp_rank = None
+            decode_tp_size = None
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -323,6 +333,8 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wq_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            decode_tp_rank=decode_tp_rank,
+            decode_tp_size=decode_tp_size,
         )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
@@ -349,6 +361,8 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            decode_tp_rank=decode_tp_rank,
+            decode_tp_size=decode_tp_size,
         )
 
         self.attn_mqa = RadixAttention(
@@ -364,6 +378,13 @@ class MQALayer(nn.Module):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+        # Save decode TP info for forward (wo_a slicing, view shapes)
+        self.decode_tp_rank = decode_tp_rank
+        self.decode_tp_size = decode_tp_size
+        if decode_tp_size is not None and decode_tp_size > 1:
+            self.decode_local_heads = self.n_heads // decode_tp_size
+            self.decode_local_groups = self.n_groups // decode_tp_size
 
     def _compute_q_a(
         self,
@@ -381,9 +402,13 @@ class MQALayer(nn.Module):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        use_decode_slice: bool = False,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
+        q, _ = self.wq_b(q, use_decode_slice=use_decode_slice)
+        local_heads = (
+            self.decode_local_heads if use_decode_slice else self.n_local_heads
+        )
+        q = q.view(-1, local_heads, self.head_dim)
         if q_out is None:
             q_out = torch.empty_like(q)
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
@@ -447,6 +472,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
+        use_decode_slice: bool = False,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
@@ -494,7 +520,7 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_lora, positions, q_out, use_decode_slice=use_decode_slice)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -508,6 +534,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
+        use_decode_slice: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
@@ -516,7 +543,7 @@ class MQALayer(nn.Module):
             q_lora, _ = self.wq_a(x)
             qkv_a = None
         q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_lora, positions, q_out, use_decode_slice=use_decode_slice)
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
@@ -558,6 +585,20 @@ class MQALayer(nn.Module):
 
         return q, kv
 
+    def _init_decode_wo_a_slices(self):
+        rank, size = self.decode_tp_rank, self.decode_tp_size
+        g_chunk = self.n_groups // size
+        full_fp8 = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
+        self._decode_wo_a_weight = full_fp8[rank * g_chunk : (rank + 1) * g_chunk]
+        self._decode_wo_a_bf16 = self._decode_wo_a_weight
+        if (
+            hasattr(self.wo_a, "weight_scale_inv")
+            and self.wo_a.weight_scale_inv is not None
+        ):
+            self._decode_wo_a_scale = self.wo_a.weight_scale_inv.data[
+                rank * g_chunk : (rank + 1) * g_chunk
+            ]
+
     def forward(
         self,
         x: torch.Tensor,
@@ -577,6 +618,15 @@ class MQALayer(nn.Module):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        # Decode slice: when CP mode repeats weights (tp_size=1) and
+        # we're not in CP prefill, slice weights to compute only local
+        # heads/groups matching normal TP behavior.
+        use_decode_slice = (
+            self.decode_tp_size is not None
+            and self.decode_tp_size > 1
+            and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+        )
+
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -591,18 +641,41 @@ class MQALayer(nn.Module):
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
+        elif use_decode_slice:
+            # CP mode decode slice: FlashMLA requires full h_q,
+            # so pad q to (T, n_heads, head_dim) with local_heads in the right slice
+            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
+            rank = self.decode_tp_rank
+            tp_slice = slice(
+                rank * self.decode_local_heads, (rank + 1) * self.decode_local_heads
+            )
+            q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             q = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, q_out
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                use_decode_slice=use_decode_slice,
             )
             kv = None
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, q_out
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                use_decode_slice=use_decode_slice,
             )
+
+        local_groups = (
+            self.decode_local_groups if use_decode_slice else self.n_local_groups
+        )
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -628,13 +701,21 @@ class MQALayer(nn.Module):
             inverse=True,
         )
 
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+        o = o.view(o.shape[0], local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
             T, G, D = o.shape
             R = self.o_lora_rank
+            if use_decode_slice:
+                if not hasattr(self, "_decode_wo_a_weight"):
+                    self._init_decode_wo_a_slices()
+                wo_a_w = self._decode_wo_a_weight
+                wo_a_s = self._decode_wo_a_scale
+            else:
+                wo_a_w = self.wo_a.weight.view(G, R, D)
+                wo_a_s = self.wo_a.weight_scale_inv.data
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
@@ -644,16 +725,21 @@ class MQALayer(nn.Module):
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                (wo_a_w, wo_a_s),
                 output,
                 recipe=(1, 1, 128),
             )
             o = output
         else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            if use_decode_slice:
+                if not hasattr(self, "_decode_wo_a_weight"):
+                    self._init_decode_wo_a_slices()
+                wo_a = self._decode_wo_a_bf16
+            else:
+                wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
-        o, _ = self.wo_b(o.flatten(1))
+        o, _ = self.wo_b(o.flatten(1), use_decode_slice=use_decode_slice)
 
         return o
 

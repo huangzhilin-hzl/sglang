@@ -1159,7 +1159,7 @@ def prepare_block_fp8_matmul_inputs(
     M = A.numel() // A.shape[-1]
 
     assert B.ndim == 2
-    assert B.is_contiguous()
+    assert B.stride(-1) == 1 or B.stride(-2) == 1
     assert Bs.ndim == 2
     N, K = B.shape
 

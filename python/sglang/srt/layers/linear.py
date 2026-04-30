@@ -328,6 +328,8 @@ class ColumnParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
+        decode_tp_rank: Optional[int] = None,
+        decode_tp_size: Optional[int] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -342,6 +344,8 @@ class ColumnParallelLinear(LinearBase):
         if tp_size is None:
             tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        self.decode_tp_rank = decode_tp_rank
+        self.decode_tp_size = decode_tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -464,12 +468,51 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def _init_decode_slices(self):
+        rank, size = self.decode_tp_rank, self.decode_tp_size
+        w = self.weight.data
+        chunk = w.shape[0] // size
+        self._decode_weight = w[rank * chunk : (rank + 1) * chunk]
+        self._decode_output_size = self._decode_weight.shape[0]
+        self._decode_scales = {}
+        for attr in ("weight_scale_inv", "weight_scale"):
+            s = getattr(self, attr, None)
+            if s is not None:
+                s = s.data
+                sc = s.shape[0] // size
+                self._decode_scales[attr] = s[rank * sc : (rank + 1) * sc]
+
+    def forward(self, input_, use_decode_slice=False):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
+        use_decode_slice = (
+            use_decode_slice
+            and self.decode_tp_size is not None
+            and self.decode_tp_size > 1
+        )
+        if use_decode_slice:
+            if not hasattr(self, "_decode_weight"):
+                self._init_decode_slices()
+            orig_weight = self.weight.data
+            self.weight.data = self._decode_weight
+            orig_osp = self.output_size_per_partition
+            self.output_size_per_partition = self._decode_output_size
+
+            orig_scales = {}
+            for attr, sliced in self._decode_scales.items():
+                orig_scales[attr] = getattr(self, attr).data
+                getattr(self, attr).data = sliced
+
         output_parallel = self.quant_method.apply(self, input_, bias)
+
+        if use_decode_slice:
+            self.weight.data = orig_weight
+            self.output_size_per_partition = orig_osp
+            for key, val in orig_scales.items():
+                getattr(self, key).data = val
+
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1378,6 +1421,8 @@ class RowParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
+        decode_tp_rank: Optional[int] = None,
+        decode_tp_size: Optional[int] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1387,6 +1432,8 @@ class RowParallelLinear(LinearBase):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce
+        self.decode_tp_rank = decode_tp_rank
+        self.decode_tp_size = decode_tp_size
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
@@ -1517,7 +1564,25 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+    def _init_decode_slices(self):
+        rank, size = self.decode_tp_rank, self.decode_tp_size
+        w = self.weight.data
+        chunk = w.shape[1] // size
+        self._decode_weight = w[:, rank * chunk : (rank + 1) * chunk]
+        self._decode_input_size = self._decode_weight.shape[1]
+        self._decode_scales = {}
+        for attr in ("weight_scale_inv", "weight_scale"):
+            s = getattr(self, attr, None)
+            if s is not None:
+                s = s.data
+                sc = s.shape[-1] // size
+                self._decode_scales[attr] = s[
+                    :, rank * sc : (rank + 1) * sc
+                ].contiguous()
+
+    def forward(
+        self, input_, skip_all_reduce=False, forward_batch=None, use_decode_slice=False
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1531,6 +1596,25 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        use_decode_slice = (
+            use_decode_slice
+            and self.decode_tp_size is not None
+            and self.decode_tp_size > 1
+        )
+        if use_decode_slice:
+            if not hasattr(self, "_decode_weight"):
+                self._init_decode_slices()
+            orig_weight = self.weight.data
+            self.weight.data = self._decode_weight
+            orig_ispp = self.input_size_per_partition
+            self.input_size_per_partition = self._decode_input_size
+
+            orig_scales = {}
+            for attr, sliced in self._decode_scales.items():
+                orig_scales[attr] = getattr(self, attr).data
+                getattr(self, attr).data = sliced
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
@@ -1540,7 +1624,15 @@ class RowParallelLinear(LinearBase):
         with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+        if use_decode_slice:
+            self.weight.data = orig_weight
+            self.input_size_per_partition = orig_ispp
+            for key, val in orig_scales.items():
+                getattr(self, key).data = val
+
+        if (
+            (self.reduce_results and self.tp_size > 1) or use_decode_slice
+        ) and not skip_all_reduce:
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
