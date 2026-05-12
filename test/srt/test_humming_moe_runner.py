@@ -1,3 +1,5 @@
+import importlib
+import sys
 import unittest
 
 import torch
@@ -13,6 +15,20 @@ class _DummyLayer(torch.nn.Module):
 
 
 class TestHummingMoeRunner(CustomTestCase):
+    def test_humming_moe_import_does_not_load_multimodal_gen(self):
+        module_name = "sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum"
+        sys.modules.pop(module_name, None)
+        before = set(sys.modules)
+
+        importlib.import_module(module_name)
+
+        new_multimodal_modules = [
+            module
+            for module in sys.modules
+            if module.startswith("sglang.multimodal_gen") and module not in before
+        ]
+        self.assertEqual([], new_multimodal_modules)
+
     def test_none_a2a_reuses_runner_core(self):
         old_backend = moe_utils.MOE_A2A_BACKEND
         try:
