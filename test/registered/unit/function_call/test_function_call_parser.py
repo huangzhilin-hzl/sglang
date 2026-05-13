@@ -2221,6 +2221,64 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(tool_calls_by_index[0]["name"], "submit")
         self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
+    def test_streaming_clears_completed_tool_calls_wrapper(self):
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '{"city": "Tokyo"}'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+
+        result = self.detector.parse_streaming_increment(text, self.tools)
+        self.assertGreater(len(result.calls), 0)
+        self.assertEqual(self.detector._buffer, "")
+
+        next_result = self.detector.parse_streaming_increment(
+            "plain follow-up", self.tools
+        )
+        self.assertEqual(next_result.normal_text, "plain follow-up")
+
+    def test_streaming_long_json_argument(self):
+        query = "x" * 20000
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="search">'
+            + json.dumps({"query": query})
+            + "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+
+        self.detector = DeepSeekV4Detector()
+        calls = []
+        for i in range(0, len(text), 37):
+            result = self.detector.parse_streaming_increment(
+                text[i : i + 37], self.tools
+            )
+            calls.extend(result.calls)
+
+        name = next(call.name for call in calls if call.name)
+        arguments = "".join(call.parameters or "" for call in calls)
+        self.assertEqual(name, "search")
+        self.assertEqual(json.loads(arguments)["query"], query)
+        self.assertEqual(self.detector._buffer, "")
+
+    def test_streaming_aborts_when_dsml_buffer_exceeds_limit(self):
+        self.detector = DeepSeekV4Detector()
+        self.detector.max_streaming_buffer_chars = 128
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="search">'
+            '{"query": "' + ("x" * 256)
+        )
+
+        result = self.detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+        self.assertEqual(self.detector._buffer, "")
+        self.assertEqual(self.detector.current_tool_id, -1)
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     """Test suite for Qwen3CoderDetector."""

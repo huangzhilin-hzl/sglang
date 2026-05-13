@@ -13,7 +13,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _partial_json_loads
 
 try:
     from xgrammar import StructuralTag
@@ -92,6 +92,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
     Reference: DeepSeek V3.2 format specification
     """
 
+    MAX_STREAMING_BUFFER_CHARS = 65536
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"
@@ -104,35 +106,70 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.function_calls_regex = (
             r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
         )
-        # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
-        # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
-        # tools. The `end` group is empty when the closer hasn't streamed in.
-        self.invoke_regex = (
-            r'<｜DSML｜invoke\s+name="(?P<name>[^"]+)"\s*'
-            r"(?:(?P<self_close>/>)"
-            r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
-        )
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        self.invoke_start_regex = re.compile(
+            r'<｜DSML｜invoke\s+name="([^"]+)"\s*(/?)>'
+        )
+        self.max_streaming_buffer_chars = self.MAX_STREAMING_BUFFER_CHARS
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or "<｜DSML｜invoke" in text
 
-    @staticmethod
-    def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
-        """Returns (name, body, is_complete) for an invoke_regex match.
+    def _find_common_prefix_len(self, s1: str, s2: str) -> int:
+        min_length = min(len(s1), len(s2))
+        for i in range(min_length):
+            if s1[i] != s2[i]:
+                return i
+        return min_length
 
-        Self-closing invokes have empty body and are always complete.
-        Long-form bodies are always strings (possibly empty); they're
-        incomplete when matched against `$` because the closing tag
-        hasn't streamed in yet.
-        """
-        name = m.group("name").strip()
-        if m.group("self_close"):
-            return name, "", True
-        return name, m.group("body"), bool(m.group("end"))
+    def _find_invoke(
+        self, text: str, start: int = 0, allow_partial: bool = False
+    ) -> tuple[str, str, bool, int, int] | None:
+        """Find one DSML invoke block without running a regex over the body."""
+        match = self.invoke_start_regex.search(text, start)
+        if not match:
+            return None
+
+        func_name = match.group(1).strip()
+        if match.group(2):
+            return func_name, "", True, match.start(), match.end()
+
+        close_start = text.find(self.invoke_end_token, match.end())
+        if close_start == -1:
+            if not allow_partial:
+                return None
+            return func_name, text[match.end() :], False, match.start(), len(text)
+
+        invoke_end = close_start + len(self.invoke_end_token)
+        return (
+            func_name,
+            text[match.end() : close_start],
+            True,
+            match.start(),
+            invoke_end,
+        )
+
+    def _clear_completed_wrapper_if_only_tail(self) -> None:
+        if self.eot_token not in self._buffer:
+            return
+        tail = self._buffer.replace(self.eot_token, "")
+        if tail.strip() == "":
+            self._buffer = ""
+
+    def _reset_streaming_state(self) -> None:
+        self._buffer = ""
+        self.prev_tool_call_arr = []
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool = []
+
+    def _abort_streaming_parse(self, reason: str) -> StreamingParseResult:
+        logger.warning("Abort DeepSeek DSML tool-call streaming parse: %s", reason)
+        self._reset_streaming_state()
+        return StreamingParseResult(normal_text="", calls=[])
 
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
@@ -234,14 +271,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            for invoke_match in re.finditer(
-                self.invoke_regex, function_calls_content, re.DOTALL
-            ):
-                func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
+            search_start = 0
+            while invoke := self._find_invoke(function_calls_content, search_start):
+                func_name, invoke_content, _, _, invoke_end = invoke
                 func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": json.loads(func_args)}
                 calls.extend(self.parse_base_json(match_result, tools))
+                search_start = invoke_end
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
@@ -281,22 +318,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
+        if (
+            self.max_streaming_buffer_chars is not None
+            and len(self._buffer) > self.max_streaming_buffer_chars
+        ):
+            return self._abort_streaming_parse(
+                f"buffer exceeded {self.max_streaming_buffer_chars} chars"
+            )
+
         all_calls: list[ToolCallItem] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=self.invoke_regex,
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
-                if not invoke_match:
+                invoke = self._find_invoke(current_text, allow_partial=True)
+                if not invoke:
                     break
 
-                func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
-                    invoke_match
-                )
+                func_name, invoke_content, is_tool_end, _, invoke_end = invoke
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -340,9 +379,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 elif prev_params is not None:
                     # If partial, send stable prefix diff
                     if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
+                        prefix_len = self._find_common_prefix_len(
+                            current_params, prev_params
+                        )
+                        if prefix_len > sent_len:
+                            argument_diff = current_params[sent_len:prefix_len]
 
                 if argument_diff:
                     all_calls.append(
@@ -363,7 +404,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # Check if tool call is complete (has closing tag)
                 if is_tool_end:
                     # Remove the completed tool call from buffer
-                    self._buffer = current_text[invoke_match.end() :]
+                    self._buffer = current_text[invoke_end:]
                     current_text = self._buffer  # Update for next iteration
 
                     # Move to next tool call
@@ -378,6 +419,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
+            self._clear_completed_wrapper_if_only_tail()
             return StreamingParseResult(normal_text="", calls=all_calls)
 
         except Exception as e:

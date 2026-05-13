@@ -10,14 +10,11 @@ from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 
 def _find_common_prefix(s1: str, s2: str) -> str:
-    prefix = ""
     min_length = min(len(s1), len(s2))
     for i in range(0, min_length):
-        if s1[i] == s2[i]:
-            prefix += s1[i]
-        else:
-            break
-    return prefix
+        if s1[i] != s2[i]:
+            return s1[:i]
+    return s1[:min_length]
 
 
 def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
