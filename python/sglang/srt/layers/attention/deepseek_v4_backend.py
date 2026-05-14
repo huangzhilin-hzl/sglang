@@ -1253,29 +1253,30 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     ):
         if self.speculative_num_steps == 1:
             return
+        original_out_cache_loc = forward_batch.out_cache_loc
         step_out_cache_loc = self._split_out_cache_loc_by_step(
-            forward_batch.out_cache_loc
+            original_out_cache_loc
         )
-        self.attn_backends[0]._replay_forward_batch = forward_batch
-        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
-        self.attn_backends[0]._replay_forward_batch = None
-        temp_metadata = self.attn_backends[0].forward_metadata
 
-        for i in range(1, self.speculative_num_steps - 1):
-            self.attn_backends[i].replay_cuda_graph_metadata_from(
-                bs=bs,
-                temp_metadata=temp_metadata,
-                bucket=_GraphBucket.DECODE_OR_IDLE,
-            )
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                if step_out_cache_loc is not None:
+                    forward_batch.out_cache_loc = step_out_cache_loc[i]
+                self.attn_backends[i]._replay_forward_batch = forward_batch
+                self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                    bs=bs,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    encoder_lens=None,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=forward_batch.spec_info,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
+            for backend in self.attn_backends:
+                backend._replay_forward_batch = None
 
 
 def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
