@@ -1220,21 +1220,27 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         original_out_cache_loc = forward_batch.out_cache_loc
         original_seq_lens = forward_batch.seq_lens
         original_seq_lens_cpu = forward_batch.seq_lens_cpu
+        original_seq_lens_sum = forward_batch.seq_lens_sum
         step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
 
         try:
             for i in range(self.speculative_num_steps - 1):
                 step_offset = i + 1
+                step_seq_lens_sum = (
+                    original_seq_lens_sum + step_offset * original_seq_lens.numel()
+                )
                 if step_out_cache_loc is not None:
                     forward_batch.out_cache_loc = step_out_cache_loc[i]
                 forward_batch.seq_lens = original_seq_lens + step_offset
                 if original_seq_lens_cpu is not None:
                     forward_batch.seq_lens_cpu = original_seq_lens_cpu + step_offset
+                forward_batch.seq_lens_sum = step_seq_lens_sum
                 self.attn_backends[i].init_forward_metadata(forward_batch)
         finally:
             forward_batch.out_cache_loc = original_out_cache_loc
             forward_batch.seq_lens = original_seq_lens
             forward_batch.seq_lens_cpu = original_seq_lens_cpu
+            forward_batch.seq_lens_sum = original_seq_lens_sum
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
@@ -1275,12 +1281,15 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 forward_batch.seq_lens = original_seq_lens + step_offset
                 if original_seq_lens_cpu is not None:
                     forward_batch.seq_lens_cpu = original_seq_lens_cpu + step_offset
+                forward_batch.seq_lens_sum = (
+                    original_seq_lens_sum + step_offset * bs
+                )
                 self.attn_backends[i]._replay_forward_batch = forward_batch
                 self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                     bs=bs,
                     req_pool_indices=forward_batch.req_pool_indices,
                     seq_lens=forward_batch.seq_lens,
-                    seq_lens_sum=original_seq_lens_sum + step_offset * bs,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
                     encoder_lens=None,
                     forward_mode=ForwardMode.DECODE,
                     spec_info=forward_batch.spec_info,
@@ -1290,6 +1299,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             forward_batch.out_cache_loc = original_out_cache_loc
             forward_batch.seq_lens = original_seq_lens
             forward_batch.seq_lens_cpu = original_seq_lens_cpu
+            forward_batch.seq_lens_sum = original_seq_lens_sum
             for backend in self.attn_backends:
                 backend._replay_forward_batch = None
 
