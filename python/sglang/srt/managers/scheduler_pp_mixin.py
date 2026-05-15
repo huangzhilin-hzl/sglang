@@ -89,6 +89,13 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
+                if self.grammar_manager.has_waiting_grammars():
+                    with torch.profiler.record_function("sync_wait_grammar_requests"):
+                        ready_grammar_requests = (
+                            self.grammar_manager.get_ready_grammar_requests_sync()
+                        )
+                    for req in ready_grammar_requests:
+                        self._add_request_to_queue(req)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch

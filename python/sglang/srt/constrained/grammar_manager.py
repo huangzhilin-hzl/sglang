@@ -86,6 +86,41 @@ class GrammarManager:
         if isinstance(req.grammar, ReasonerGrammarObject):
             req.grammar.max_think_tokens = thinking_budget
 
+    def _resolve_grammar_future(self, req: Req) -> None:
+        assert isinstance(req.grammar, futures.Future) and req.grammar_key
+        try:
+            req.grammar = req.grammar.result()
+        except Exception as e:
+            logger.error(
+                f"Grammar compilation raised an exception: {e}, "
+                f"grammar_key={req.grammar_key}"
+            )
+            req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
+
+        self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+        self._apply_request_reasoning_budget(req)
+        if isinstance(req.grammar, InvalidGrammarObject):
+            error_msg = (
+                f"Failed to compile {req.grammar_key[0]} grammar: "
+                f"{req.grammar.error_message}"
+            )
+            req.set_finish_with_abort(error_msg)
+
+    def get_ready_grammar_requests_sync(self) -> List[Req]:
+        """Synchronously finish all queued grammar requests."""
+        assert self.grammar_backend
+        return_reqs: List[Req] = []
+
+        for req in self.grammar_queue:
+            return_reqs.append(req)
+            # NOTE: fix when abort req comes first, but req is still in to_finish status
+            if req.finished() or req.to_finish is not None or req.grammar is None:  # It is aborted by AbortReq
+                continue
+            self._resolve_grammar_future(req)
+
+        self.grammar_queue = []
+        return return_reqs
+
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
         add_to_grammar_queue = False
@@ -210,19 +245,7 @@ class GrammarManager:
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            try:
-                req.grammar = req.grammar.result()
-            except Exception as e:
-                logger.error(
-                    f"Grammar compilation raised an exception: {e}, "
-                    f"grammar_key={req.grammar_key}"
-                )
-                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-            self._apply_request_reasoning_budget(req)
-            if isinstance(req.grammar, InvalidGrammarObject):
-                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
-                req.set_finish_with_abort(error_msg)
+            self._resolve_grammar_future(req)
 
         # Return failed requests
         for i in synced_failed_req_idxs:
