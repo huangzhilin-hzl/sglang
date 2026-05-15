@@ -332,7 +332,12 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     num_tokens = T.dynamic("num_tokens")
 
-    ENABLE_PDL = is_arch_support_pdl()
+    # The two-stage split-k MHC pre path has seen cluster barrier hangs on
+    # tiny decode batches, so keep PDL opt-in for this kernel only.
+    ENABLE_PDL = (
+        envs.SGLANG_OPT_USE_TILELANG_MHC_SPLITK_PDL.get()
+        and is_arch_support_pdl()
+    )
 
     @tilelang.jit
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
