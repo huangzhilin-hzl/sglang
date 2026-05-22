@@ -43,9 +43,9 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_nsa_cp import (
-    nsa_cp_gather_hidden_states,
-    nsa_cp_reduce_scatter_hidden_states,
+from sglang.srt.layers.communicator_dsa_cp import (
+    dsa_cp_gather_hidden_states,
+    dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -319,7 +319,7 @@ class MQALayer(nn.Module):
         # When CP mode sets tp_size=1 (repeat weights), decode can slice
         # to compute only local heads/groups matching normal TP behavior.
         disable_decode_slice = get_bool_env_var("SGLANG_CP_DISABLE_DECODE_SLICE")
-        if self.nsa_enable_prefill_cp and not disable_decode_slice:
+        if self.dsa_enable_prefill_cp and not disable_decode_slice:
             decode_tp_rank = get_attention_cp_rank()
             decode_tp_size = get_attention_cp_size()
         else:
@@ -624,7 +624,7 @@ class MQALayer(nn.Module):
         use_decode_slice = (
             self.decode_tp_size is not None
             and self.decode_tp_size > 1
-            and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
         )
 
         enable_multi_stream = (
@@ -1048,7 +1048,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
-                hidden_states = nsa_cp_gather_hidden_states(hidden_states)
+                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert get_moe_a2a_backend().is_deepep(), (
                     "CP requires DeepEP (moe_a2a_backend == deepep). "
@@ -1079,7 +1079,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             use_reduce_scatter=_use_cp,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = nsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
