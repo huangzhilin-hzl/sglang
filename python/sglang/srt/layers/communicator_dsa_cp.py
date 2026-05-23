@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_local_dp_buffer,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -180,7 +181,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
@@ -225,6 +226,6 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
