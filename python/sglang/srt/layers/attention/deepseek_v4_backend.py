@@ -1209,31 +1209,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_num_steps=self.speculative_num_steps,
                 )
             )
-    def _split_out_cache_loc_by_step(
-        self, out_cache_loc: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        if out_cache_loc is None:
-            return None
-
-        slots_per_req = self.topk * self.speculative_num_steps
-        assert out_cache_loc.numel() % slots_per_req == 0, (
-            "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
-            f"[bs, topk, speculative_num_steps], got {out_cache_loc.shape=} "
-            f"{self.topk=} {self.speculative_num_steps=}"
-        )
-        num_reqs = out_cache_loc.numel() // slots_per_req
-        return (
-            out_cache_loc.reshape(num_reqs, self.topk, self.speculative_num_steps)
-            .permute(2, 0, 1)
-            .reshape(self.speculative_num_steps, -1)
-        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        original_out_cache_loc = forward_batch.out_cache_loc
         original_seq_lens = forward_batch.seq_lens
         original_seq_lens_cpu = forward_batch.seq_lens_cpu
         original_seq_lens_sum = forward_batch.seq_lens_sum
-        step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
 
         try:
             for i in range(self.speculative_num_steps - 1):
@@ -1241,15 +1221,12 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 step_seq_lens_sum = (
                     original_seq_lens_sum + step_offset * original_seq_lens.numel()
                 )
-                if step_out_cache_loc is not None:
-                    forward_batch.out_cache_loc = step_out_cache_loc[i]
                 forward_batch.seq_lens = original_seq_lens + step_offset
                 if original_seq_lens_cpu is not None:
                     forward_batch.seq_lens_cpu = original_seq_lens_cpu + step_offset
                 forward_batch.seq_lens_sum = step_seq_lens_sum
                 self.attn_backends[i].init_forward_metadata(forward_batch)
         finally:
-            forward_batch.out_cache_loc = original_out_cache_loc
             forward_batch.seq_lens = original_seq_lens
             forward_batch.seq_lens_cpu = original_seq_lens_cpu
             forward_batch.seq_lens_sum = original_seq_lens_sum
@@ -1283,7 +1260,22 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         original_seq_lens = forward_batch.seq_lens
         original_seq_lens_cpu = forward_batch.seq_lens_cpu
         original_seq_lens_sum = forward_batch.seq_lens_sum
-        step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
+        step_out_cache_loc = None
+        if original_out_cache_loc is not None:
+            slots_per_req = self.topk * self.speculative_num_steps
+            assert original_out_cache_loc.numel() % slots_per_req == 0, (
+                "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
+                f"[bs, topk, speculative_num_steps], got "
+                f"{original_out_cache_loc.shape=} {self.topk=} "
+                f"{self.speculative_num_steps=}"
+            )
+            raw_bs = original_out_cache_loc.numel() // slots_per_req
+            step_out_cache_loc = per_step_draft_out_cache_loc(
+                original_out_cache_loc,
+                raw_bs,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
         try:
             for i in range(self.speculative_num_steps - 1):
