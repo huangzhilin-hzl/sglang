@@ -2695,7 +2695,9 @@ class Scheduler(
 
         new_batch.waiting_size = len(self.waiting_queue)
 
-        new_batch.contains_last_prefill_chunk = adder.contains_last_prefill_chunk
+        new_batch.contains_last_prefill_chunk = (
+            self.chunked_req is None or len(can_run_list) != 1
+        )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:

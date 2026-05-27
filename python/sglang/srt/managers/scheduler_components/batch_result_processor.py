@@ -452,13 +452,11 @@ class SchedulerBatchResultProcessor:
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
+                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
                     logger.warning(
-                        "PP non-skip output comm: no req consumed next_token_ids. "
-                        "contains_last_prefill_chunk=%s, num_reqs=%d, "
-                        "all inflight_middle_chunks=%s",
-                        batch.contains_last_prefill_chunk,
-                        len(batch.reqs),
-                        [r.inflight_middle_chunks for r in batch.reqs],
+                        f"PP non-skip output comm: no req consumed next_token_ids. "
+                        f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
+                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
                     )
             return
 
