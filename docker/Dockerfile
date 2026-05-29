@@ -3,7 +3,7 @@
 # transfer-engine选择使用开源或者蚂蚁内部
 # deepep 使用开源或者蚂蚁内部预编译whl包，安装时直接安装whl包，不需要在镜像内编译安装
 # 这是蚂蚁内部构建sglang引擎镜像的Dockerfile, 社区的Dockerfile更名为Dockerfile.community
-# 如果cherry-pick社区commits发生冲突无法解决, 请联系 @霜林 
+# 如果cherry-pick社区commits发生冲突无法解决, 请联系 @霜林
 
 ARG RUNTIME_BASE_IMAGE
 FROM ${RUNTIME_BASE_IMAGE} AS base
@@ -218,9 +218,14 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://mirro
 # 配置rust crates.io
 COPY <<EOF /root/.cargo/config.toml
 [source.crates-io]
-replace-with = 'aliyun'
-[source.aliyun]
-registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+replace-with = 'mirror'
+
+[source.mirror]
+registry = "sparse+https://mirrors.bfsu.edu.cn/crates.io-index/"
+
+[registries.mirror]
+index = "sparse+https://mirrors.bfsu.edu.cn/crates.io-index/"
+
 EOF
 
 # Install sgl-kernel (from pre-built wheel)
@@ -479,9 +484,13 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://mirro
 # 配置rust crates.io
 COPY <<EOF /root/.cargo/config.toml
 [source.crates-io]
-replace-with = 'aliyun'
-[source.aliyun]
-registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+replace-with = 'mirror'
+
+[source.mirror]
+registry = "sparse+https://mirrors.bfsu.edu.cn/crates.io-index/"
+
+[registries.mirror]
+index = "sparse+https://mirrors.bfsu.edu.cn/crates.io-index/"
 [net]
 git-fetch-with-cli = true
 EOF
@@ -622,27 +631,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
-# The upstream flash-mla packages are required for running deepseek-v4 models
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
-    cd /sgl-workspace && git clone https://${GITHUB_ARTIFACTORY}/deepseek-ai/FlashMLA.git flash-mla \
-    && git config --global url."https://gitee.com/staugust/cutlass".insteadOf "https://github.com/NVIDIA/cutlass.git" \
-    && cd flash-mla && git submodule update --init --recursive \
-    && export CMAKE_BUILD_PARALLEL_LEVEL=2 \
-    && export MAX_JOBS=4 \
-    && export NVCC_THREADS=4 \
-    && pip install --no-build-isolation -v . ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
-    cd /sgl-workspace && git clone https://${GITHUB_ARTIFACTORY}/deepseek-ai/FlashMLA.git flash-mla \
-    && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda \
-    && cd flash-mla && git submodule update --init --recursive \
-    && export CMAKE_BUILD_PARALLEL_LEVEL=2 \
-    && export MAX_JOBS=4 \
-    && export NVCC_THREADS=4 \
-    && pip install --no-build-isolation -v . ; \
 fi
 
 # Add yank script
