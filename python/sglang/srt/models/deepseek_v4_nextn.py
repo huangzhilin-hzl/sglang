@@ -174,13 +174,17 @@ class DeepseekV4ModelNextN(nn.Module):
                 input_ids = input_ids.reshape(-1, cp_size).T.flatten()
                 input_ids_global = input_ids
 
-        hidden_states = self.decoder(
+        hidden_states, residual, post, comb = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if residual is not None:
+            # NextN has a single decoder layer, so no later layer can consume a
+            # deferred fused hc_post state.
+            hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
