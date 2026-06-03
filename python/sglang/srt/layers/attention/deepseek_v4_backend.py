@@ -1210,6 +1210,69 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
             )
 
+    def _split_out_cache_loc_by_step(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if out_cache_loc is None:
+            return None
+
+        slots_per_req = self.topk * self.speculative_num_steps
+        assert out_cache_loc.numel() % slots_per_req == 0, (
+            "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
+            f"[bs, topk, speculative_num_steps], got {out_cache_loc.shape=} "
+            f"{self.topk=} {self.speculative_num_steps=}"
+        )
+        num_reqs = out_cache_loc.numel() // slots_per_req
+        return per_step_draft_out_cache_loc(
+            out_cache_loc,
+            num_reqs,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+    def _build_step_forward_batch_view(
+        self,
+        forward_batch: ForwardBatch,
+        step_id: int,
+        *,
+        forward_mode: Optional[ForwardMode] = None,
+        slice_out_cache_loc: bool = False,
+    ):
+        from types import SimpleNamespace
+
+        step_offset = step_id + 1
+        seq_lens = forward_batch.seq_lens + step_offset
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu + step_offset
+
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + step_offset * forward_batch.batch_size
+
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if slice_out_cache_loc and out_cache_loc is not None:
+            out_cache_loc = self._split_out_cache_loc_by_step(out_cache_loc)[step_id]
+
+        return SimpleNamespace(
+            batch_size=forward_batch.batch_size,
+            forward_mode=forward_mode or forward_batch.forward_mode,
+            actual_forward_mode=getattr(
+                forward_batch, "actual_forward_mode", forward_batch.forward_mode
+            ),
+            input_ids=getattr(forward_batch, "input_ids", None),
+            positions=getattr(forward_batch, "positions", None),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            encoder_lens=getattr(forward_batch, "encoder_lens", None),
+            out_cache_loc=out_cache_loc,
+            spec_info=forward_batch.spec_info,
+            extend_seq_lens=getattr(forward_batch, "extend_seq_lens", None),
+            extend_seq_lens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -1219,46 +1282,37 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        from types import SimpleNamespace
-
-        inner_fb = SimpleNamespace(
-            batch_size=forward_batch.batch_size,
-            forward_mode=ForwardMode.DECODE,
-            # Propagate the real runtime mode so inner backends can detect IDLE
-            # and apply their idle substitution.
-            actual_forward_mode=getattr(
-                forward_batch, "actual_forward_mode", forward_batch.forward_mode
-            ),
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-            spec_info=forward_batch.spec_info,
-        )
         if in_capture:
             for i in range(self.speculative_num_steps):
+                inner_fb = self._build_step_forward_batch_view(
+                    forward_batch,
+                    i,
+                    forward_mode=ForwardMode.DECODE,
+                    slice_out_cache_loc=False,
+                )
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
         else:
             if self.speculative_num_steps == 1:
                 return
-            self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
-            temp_metadata = self.attn_backends[0].forward_metadata
-            for i in range(1, self.speculative_num_steps - 1):
-                self.attn_backends[i].replay_cuda_graph_metadata_from(
-                    bs=forward_batch.batch_size,
-                    temp_metadata=temp_metadata,
-                    bucket=_GraphBucket.DECODE_OR_IDLE,
+            for i in range(self.speculative_num_steps - 1):
+                inner_fb = self._build_step_forward_batch_view(
+                    forward_batch,
+                    i,
+                    forward_mode=ForwardMode.DECODE,
+                    slice_out_cache_loc=True,
                 )
+                self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            inner_fb = self._build_step_forward_batch_view(
+                forward_batch,
+                i,
+                slice_out_cache_loc=False,
+            )
+            self.attn_backends[i].init_forward_metadata(inner_fb)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
