@@ -1009,6 +1009,12 @@ class HummingLinearMethod(LinearMethodBase):
             force_input_schema=self.force_input_schema,
         )
 
+        from sglang.srt.layers.quantization.humming_utils import (
+            get_humming_pad_multiples,
+        )
+
+        pad_n_to_multiple, pad_k_to_multiple = get_humming_pad_multiples()
+
         # prepare layer config from humming kernel
         HummingMethod.prepare_layer_meta(
             layer=layer,
@@ -1016,8 +1022,8 @@ class HummingLinearMethod(LinearMethodBase):
             shape_k=layer.input_size_per_partition,
             weight_schema=self.weight_schema,
             input_schema=self.input_schema,
-            pad_n_to_multiple=256,
-            pad_k_to_multiple=128,
+            pad_n_to_multiple=pad_n_to_multiple,
+            pad_k_to_multiple=pad_k_to_multiple,
             has_bias=layer.with_bias,
             torch_dtype=layer.param_dtype,
             tensors=tensors,
@@ -1197,9 +1203,11 @@ class HummingMoEMethod(FusedMoEMethodBase):
             return
         from sglang.srt.layers.quantization.humming_utils import (
             configure_humming_deepep_dispatch,
+            get_humming_pad_multiples,
             make_humming_deepep_input_schema,
         )
 
+        pad_n_to_multiple, pad_k_to_multiple = get_humming_pad_multiples()
         use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
         self.weight_schemas = {}
         self.input_schemas = {}
@@ -1243,8 +1251,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 layer=layer,
                 shape_n=configs["shape_n"],
                 shape_k=configs["shape_k"],
-                pad_n_to_multiple=256,
-                pad_k_to_multiple=128,
+                pad_n_to_multiple=pad_n_to_multiple,
+                pad_k_to_multiple=pad_k_to_multiple,
                 input_schema=input_schema,
                 weight_schema=weight_schema,
                 has_bias=layer.with_bias,

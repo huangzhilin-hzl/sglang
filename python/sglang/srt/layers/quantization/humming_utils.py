@@ -102,8 +102,28 @@ def make_humming_deepep_input_schema(
     return input_schema
 
 
+def get_humming_pad_multiples() -> tuple[int, int]:
+    """Weight-buffer padding multiples for humming, from the environment.
+
+    humming only needs multiples of 64, so the 256/128 default pads all-zero tiles
+    for sharded shapes that are not multiples of it. Both values must stay legal:
+    a padded N must be tiled by the kernel, which needs a multiple of 128 for
+    16-bit activations.
+    """
+    pad_n = envs.SGLANG_HUMMING_PAD_N_MULTIPLE.get()
+    pad_k = envs.SGLANG_HUMMING_PAD_K_MULTIPLE.get()
+    is_multiple_of_64 = pad_n % 64 == 0 and pad_k % 64 == 0
+    if not is_multiple_of_64 or pad_n <= 0 or pad_k <= 0:
+        raise ValueError(
+            "SGLANG_HUMMING_PAD_{N,K}_MULTIPLE must be positive multiples of 64, "
+            f"got N={pad_n} K={pad_k}"
+        )
+    return pad_n, pad_k
+
+
 def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
     weight_schema = BaseWeightSchema.from_config(quant_config)
+    pad_n_to_multiple, pad_k_to_multiple = get_humming_pad_multiples()
     input_quant_config = envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG.get() or {}
     if humming_is_layer_skipped(input_quant_config, layer.layer_name):
         input_schema = HummingInputSchema()
@@ -177,8 +197,8 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             layer=layer,
             shape_n=shape_n,
             shape_k=shape_k,
-            pad_n_to_multiple=256,
-            pad_k_to_multiple=128,
+            pad_n_to_multiple=pad_n_to_multiple,
+            pad_k_to_multiple=pad_k_to_multiple,
             input_schema=sub_input_schema,
             weight_schema=weight_schema_new,
             has_bias=layer.with_bias,

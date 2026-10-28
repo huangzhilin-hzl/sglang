@@ -202,3 +202,66 @@ def test_hadamard_matches_each_sublayers_weight_transform(runner_module):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_without_stream_k_is_opt_in(runner_module, monkeypatch):
+    tuning = [
+        [0, 100, {"block_shape": [64, 128, 128], "use_stream_k": True, "num_sms": 512}]
+    ]
+    monkeypatch.setattr(
+        runner_module.envs.SGLANG_HUMMING_MOE_NO_STREAM_K, "get", lambda: False
+    )
+    assert runner_module.HummingRunnerCore._without_stream_k(tuning) is tuning
+
+
+def test_without_stream_k_drops_the_stream_k_grid(runner_module, monkeypatch):
+    tuning = [
+        [0, 100, {"block_shape": [64, 128, 128], "use_stream_k": True, "num_sms": 512}],
+        [100, 1 << 30, {"block_shape": [128, 128, 128], "use_stream_k": False}],
+    ]
+    monkeypatch.setattr(
+        runner_module.envs.SGLANG_HUMMING_MOE_NO_STREAM_K, "get", lambda: True
+    )
+
+    patched = runner_module.HummingRunnerCore._without_stream_k(tuning)
+
+    # A stream-K range loses both the flag and the virtual SM count it was sized for.
+    assert patched[0] == [0, 100, {"block_shape": [64, 128, 128], "use_stream_k": False}]
+    # A range that never used stream-K keeps its grid untouched.
+    assert patched[1] == [100, 1 << 30, {"block_shape": [128, 128, 128], "use_stream_k": False}]
+    # The caller's list is left alone.
+    assert tuning[0][2]["num_sms"] == 512
+
+
+@pytest.mark.parametrize("num_local_experts, expected_rows", [(3, 3), (1, 1)])
+def test_ep_local_shape_m_uses_the_rank_share(
+    runner_module, monkeypatch, num_local_experts, expected_rows
+):
+    runner = make_runner(runner_module)
+    runner.num_experts = num_local_experts
+    runner.global_num_experts = 6
+    # Three tokens, top-2: six routed rows in total, shared out across six experts.
+    topk_ids = torch.tensor([[0, 1], [2, -1], [0, 2]], dtype=torch.int32)
+
+    monkeypatch.setattr(
+        runner_module.envs.SGLANG_HUMMING_MOE_EP_LOCAL_SHAPE_M, "get", lambda: False
+    )
+    assert runner.estimate_local_valid_shape_m(topk_ids) == 6
+
+    monkeypatch.setattr(
+        runner_module.envs.SGLANG_HUMMING_MOE_EP_LOCAL_SHAPE_M, "get", lambda: True
+    )
+    assert runner.estimate_local_valid_shape_m(topk_ids) == expected_rows
+
+
+def test_ep_local_shape_m_keeps_the_explicit_estimate(runner_module, monkeypatch):
+    runner = make_runner(runner_module)
+    runner.num_experts = 3
+    runner.global_num_experts = 6
+    monkeypatch.setattr(
+        runner_module.envs.SGLANG_HUMMING_MOE_EP_LOCAL_SHAPE_M, "get", lambda: True
+    )
+
+    topk_ids = torch.tensor([[0, 1], [2, -1]], dtype=torch.int32)
+
+    assert runner.estimate_local_valid_shape_m(topk_ids, expected_m=7) == 7 * 3

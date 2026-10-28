@@ -1133,6 +1133,22 @@ class Envs:
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
+    # Padding multiples for the humming weight buffers. The kernels only require
+    # multiples of 64, so 256/128 pads whole all-zero tiles whenever a sharded
+    # shape is not a multiple of them (DSv4.1-Flash TP8 pads w13 576 -> 768 and
+    # w2 K 288 -> 384, about 33% extra expert-weight traffic per layer). 16-bit
+    # activations additionally need an N multiple of at least 128.
+    SGLANG_HUMMING_PAD_N_MULTIPLE = EnvInt(256)
+    SGLANG_HUMMING_PAD_K_MULTIPLE = EnvInt(128)
+    # Drop stream-K from the humming MoE tile selection. Stream-K reduces a tile's
+    # K slices in arrival order (bf16 atomics), so repeated forwards of the same
+    # input are not bitwise identical. Enabling this trades large-batch throughput
+    # for reproducible output.
+    SGLANG_HUMMING_MOE_NO_STREAM_K = EnvBool(False)
+    # Under EP a rank only routes to its own experts, so the routed-row count is
+    # about topk_ids.numel() / ep_size. Scale the tile-selection row estimate by
+    # that share instead of assuming every expert is local.
+    SGLANG_HUMMING_MOE_EP_LOCAL_SHAPE_M = EnvBool(False)
 
     # ===================================================================
     # FlashInfer, FlashMLA, and TRT-LLM

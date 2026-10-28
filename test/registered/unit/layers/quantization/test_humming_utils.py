@@ -186,3 +186,33 @@ class TestHummingDeepEpSchema(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHummingPadMultiples(CustomTestCase):
+    @staticmethod
+    def _pad_multiples(pad_n, pad_k):
+        with (
+            patch.object(
+                humming_utils.envs.SGLANG_HUMMING_PAD_N_MULTIPLE,
+                "get",
+                return_value=pad_n,
+            ),
+            patch.object(
+                humming_utils.envs.SGLANG_HUMMING_PAD_K_MULTIPLE,
+                "get",
+                return_value=pad_k,
+            ),
+        ):
+            return humming_utils.get_humming_pad_multiples()
+
+    def test_default_multiples_are_unchanged(self):
+        self.assertEqual(self._pad_multiples(256, 128), (256, 128))
+
+    def test_env_overrides_both_multiples(self):
+        self.assertEqual(self._pad_multiples(64, 64), (64, 64))
+
+    def test_rejects_multiples_the_kernels_cannot_tile(self):
+        with self.assertRaisesRegex(ValueError, "multiples of 64"):
+            self._pad_multiples(96, 128)
+        with self.assertRaisesRegex(ValueError, "multiples of 64"):
+            self._pad_multiples(256, 0)

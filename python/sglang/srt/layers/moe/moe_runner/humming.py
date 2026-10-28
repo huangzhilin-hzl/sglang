@@ -182,6 +182,8 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=humming_gemm_type,
             sublayer_name="w2",
         )
+        w13_tuning_config = self._without_stream_k(w13_tuning_config)
+        w2_tuning_config = self._without_stream_k(w2_tuning_config)
         self.humming_gemm_configs[humming_gemm_type.value] = {
             "compute_config": compute_config,
             "w13_tuning_config": w13_tuning_config,
@@ -193,6 +195,31 @@ class HummingRunnerCore(MoeRunnerCore):
 
         return self.humming_gemm_configs[humming_gemm_type.value]
 
+    @staticmethod
+    def _without_stream_k(tuning_configs: list) -> list:
+        """Turn every stream-K range into a data-parallel one.
+
+        Stream-K adds a tile's K slices into the bf16 output in arrival order
+        (read-add-write, or bf16 atomics once a tile has more than three slices),
+        so the same input can give different bits on repeated forwards. Only
+        requested explicitly: stream-K is otherwise the faster choice for the
+        row counts where humming selects it.
+        """
+        if not envs.SGLANG_HUMMING_MOE_NO_STREAM_K.get():
+            return tuning_configs
+
+        patched_configs = []
+        for min_shape_m, max_shape_m, config in tuning_configs:
+            if not config.get("use_stream_k"):
+                patched_configs.append([min_shape_m, max_shape_m, config])
+                continue
+            # A stream-K grid is sized against a virtual SM count; drop that
+            # override together with stream-K so the launch uses the real grid.
+            config = {k: v for k, v in config.items() if k != "num_sms"}
+            config["use_stream_k"] = False
+            patched_configs.append([min_shape_m, max_shape_m, config])
+        return patched_configs
+
     def estimate_local_valid_shape_m(
         self,
         topk_ids: torch.Tensor,
@@ -202,7 +229,20 @@ class HummingRunnerCore(MoeRunnerCore):
         if expected_m is not None:
             return expected_m * self.num_experts
 
-        # TODO: update for EP and DP
+        if envs.SGLANG_HUMMING_MOE_EP_LOCAL_SHAPE_M.get():
+            # With EP every rank routes only to its own experts (the dispatcher
+            # maps foreign experts to -1 and moe_align_block_size skips them), so
+            # this rank sees about 1/ep_size of the routed rows.
+            has_expert_parallelism = (
+                self.num_experts > 0
+                and self.global_num_experts > self.num_experts
+                and self.global_num_experts % self.num_experts == 0
+            )
+            if has_expert_parallelism:
+                ep_size = self.global_num_experts // self.num_experts
+                return max(1, topk_ids.nelement() // ep_size)
+
+        # TODO: update for DP
         return topk_ids.nelement()
 
     def get_buffer_metas(
@@ -295,18 +335,13 @@ class HummingRunnerCore(MoeRunnerCore):
 
         return buffer_metas, required_buffers
 
-    def _workspace_shapes(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
+    @staticmethod
+    def _layout_workspaces(
+        buffer_metas: dict,
+        required_buffers: list,
         gemm_type: HummingGemmType,
     ):
-        buffer_metas, required_buffers = self.get_buffer_metas(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
-
+        """Size the two alternating workspaces and name the output buffer."""
         workspace1_nbytes = 0
         workspace2_nbytes = 0
 
@@ -324,7 +359,22 @@ class HummingRunnerCore(MoeRunnerCore):
         )
         output_shape = buffer_metas[output_key]["shape"]
 
-        return (workspace1_nbytes // 2,), (workspace2_nbytes // 2,), output_shape
+        workspace1_shape = (workspace1_nbytes // 2,)
+        workspace2_shape = (workspace2_nbytes // 2,)
+        return workspace1_shape, workspace2_shape, output_shape
+
+    def _workspace_shapes(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        gemm_type: HummingGemmType,
+    ):
+        buffer_metas, required_buffers = self.get_buffer_metas(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            gemm_type=gemm_type,
+        )
+        return self._layout_workspaces(buffer_metas, required_buffers, gemm_type)
 
     def make_workspaces(
         self,
@@ -347,16 +397,22 @@ class HummingRunnerCore(MoeRunnerCore):
         topk_ids: torch.Tensor,
         gemm_type: HummingGemmType,
     ) -> dict[str, torch.Tensor]:
-        workspace1, workspace2, output = self.make_workspaces(
-            hidden_states=hidden_states,
-            topk_ids=topk_ids,
-            gemm_type=gemm_type,
-        )
+        # Resolve the buffer metas once: they depend only on the dispatch shapes,
+        # and every forward pass of every layer used to build them twice.
         buffer_metas, required_buffers = self.get_buffer_metas(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             gemm_type=gemm_type,
         )
+        workspace1_shape, workspace2_shape, output_shape = self._layout_workspaces(
+            buffer_metas, required_buffers, gemm_type
+        )
+        torch_dtype = self.layer.params_dtype
+        device = hidden_states.device
+        workspace1 = torch.empty(workspace1_shape, dtype=torch_dtype, device=device)
+        workspace2 = torch.empty(workspace2_shape, dtype=torch_dtype, device=device)
+        output = workspace1[: math.prod(output_shape)].view(*output_shape)
+
         buffers = {"output": output}
         for index, name in enumerate(required_buffers[::-1]):
             buffer_meta = buffer_metas[name]
