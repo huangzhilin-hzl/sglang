@@ -1,0 +1,24 @@
+python/sglang/kernels/jit/csrc/gemm/per_token_group_quant.cuh
+  h_65d95dfcbf63bf 537
+python/sglang/kernels/ops/quantization/fp8_kernel.py
+  h_65d95dfcbf63bf 509,511-533,565-573,589-591,609-621,623-624,629-652,679,724
+python/sglang/kernels/ops/quantization/per_token_group_quant.py
+  h_65d95dfcbf63bf 130-156,161-163,167,171
+python/sglang/srt/layers/quantization/fp8_utils.py
+  h_65d95dfcbf63bf 1989,1991-1996
+test/registered/kernels/ops/quantization/test_per_token_group_quant.py
+  h_65d95dfcbf63bf 238-363
+test/registered/unit/layers/quantization/test_fp8_blockwise_linear_backends.py
+  h_65d95dfcbf63bf 271-323
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4dbdc429c6738c8bbed05270dd012be22bcfbb3d",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
