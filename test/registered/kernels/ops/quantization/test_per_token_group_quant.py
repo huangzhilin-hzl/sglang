@@ -235,6 +235,132 @@ def test_fp32_pow2_public_fallback(dtype, group_size):
     assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
 
 
+def _check_fp32_pow2_col_major_tma(x: torch.Tensor, group_size: int):
+    q_ref, s_ref = ref_fp8_fp32_pow2(x, group_size)
+    q, s = sglang_per_token_group_quant_fp8(
+        x,
+        group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        scale_packed=False,
+    )
+    aligned_m = (x.shape[0] + 3) // 4 * 4
+    assert q.shape == x.shape and q.dtype == fp8_dtype
+    assert s.shape == (x.shape[0], x.shape[1] // group_size)
+    assert s.dtype == torch.float32
+    if x.shape[0] > 0:
+        assert s.stride() == (1, aligned_m)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.contiguous().view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (0, 5120),
+        (1, 128),
+        (3, 128),
+        (5, 256),
+        (33, 256),
+        (64, 5120),
+        (128, 1536),
+        (1024, 5120),
+    ],
+)
+def test_fp32_pow2_col_major_tma(shape, group_size):
+    torch.manual_seed(42 + group_size + shape[0])
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2_col_major_tma(x, group_size)
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("offset", [8, 16])
+def test_fp32_pow2_col_major_tma_offset_view(group_size, offset):
+    # 16B-aligned input views fall back cleanly without corrupting FP32 scales.
+    torch.manual_seed(17 + group_size + offset)
+    storage = torch.randn(5 * 256 + offset, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2_col_major_tma(storage[offset:].view(5, 256), group_size)
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_fp32_pow2_col_major_tma_fp16_fallback(group_size):
+    x = torch.zeros(5, 256, device="cuda", dtype=torch.float16)
+    x[1] = torch.finfo(torch.float16).tiny
+    x[2] = torch.finfo(torch.float16).max
+    x[3] = -1.5
+    x[4] = 3.25
+    _check_fp32_pow2_col_major_tma(x, group_size)
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_fp32_pow2_col_major_tma_graph_replay(group_size):
+    x = torch.zeros(33, 256, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        scale_packed=False,
+    )
+
+    def run():
+        sglang_per_token_group_quant_fp8(
+            x,
+            group_size,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+            scale_packed=False,
+            output_q=q,
+            output_s=s,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for value in (0.0, 1.0, -1.0):
+        x.normal_()
+        x[0, :group_size] = value
+        graph.replay()
+        q_ref, s_ref = ref_fp8_fp32_pow2(x, group_size)
+        assert s.stride() == (1, 36)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.contiguous().view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("offset", [0, 8])
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_fp32_pow2_col_major_tma_compile(group_size, offset, backend):
+    def quantize(x):
+        return sglang_per_token_group_quant_fp8(
+            x,
+            group_size,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+            scale_packed=False,
+        )
+
+    storage = torch.randn(33 * 256 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(33, 256)
+    compiled = torch.compile(quantize, backend=backend, fullgraph=True, dynamic=True)
+    for value in (0.0, 1.0):
+        x.normal_()
+        x[0, :group_size] = value
+        q, s = compiled(x)
+        q_ref, s_ref = ref_fp8_fp32_pow2(x, group_size)
+        assert s.dtype == torch.float32 and s.stride() == (1, 36)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.contiguous().view(torch.int32), s_ref.view(torch.int32))
+
+
 def _decode_packed_exp(s_int32: torch.Tensor, ng: int) -> torch.Tensor:
     """Decode an int32 packed-UE8M0 scale (logical [..., ceil(ng/4)]) to the
     [..., ng] exponent grid, independent of the physical (row/col-major) layout:

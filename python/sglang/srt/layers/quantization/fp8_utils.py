@@ -1986,9 +1986,14 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
-        # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
+        # DeepGEMM consumes MN-major, TMA-aligned fp32 scales directly.
         q_input, x_scale = sglang_per_token_group_quant_fp8(
-            input_2d, block_size[1], scale_ue8m0=True
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+            scale_packed=False,
         )
     elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(

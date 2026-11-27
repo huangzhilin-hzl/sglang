@@ -534,7 +534,7 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({N, H}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).ensure_alignment(16).verify(
         output_q);
-    TensorMatcher({N, G}).with_dtype<S>().with_device(device).verify(output_s);
+    TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
   } else if constexpr (kMasked) {
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
