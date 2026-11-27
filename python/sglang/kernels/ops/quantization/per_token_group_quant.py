@@ -123,33 +123,52 @@ def _per_token_group_quant_custom_op(
         scale_ue8m0
         and output_s.dtype == torch.float32
         and output_s.ndim == 2
-        and output_s.is_contiguous()
         and not fuse_silu_and_mul
         and masked_m is None
         and sorted_token_ids is None
     ):
-        # Contiguity ignores singleton strides. Give both launchers a row-major
-        # view of the same FP32 storage so v2 cannot mistake it for packed scales.
-        scale_strides = (max(output_s.shape[1], 1), 1)
-        if output_s.stride() != scale_strides:
-            output_s = output_s.as_strided(output_s.shape, scale_strides)
-        # Query the input device at execution time: no import-time CUDA/NVML
-        # dependency and no device/pointer introspection in Dynamo tracing.
-        if (
-            torch.cuda.get_device_capability(input.device)[0] != 9
-            or input.data_ptr() % 32
-        ):
+        if output_s.is_contiguous():
+            # Contiguity ignores singleton strides. Give both launchers a row-major
+            # view of the same FP32 storage so v2 cannot mistake it for packed scales.
+            scale_strides = (max(output_s.shape[1], 1), 1)
+            if output_s.stride() != scale_strides:
+                output_s = output_s.as_strided(output_s.shape, scale_strides)
+            # Query the input device at execution time: no import-time CUDA/NVML
+            # dependency and no device/pointer introspection in Dynamo tracing.
+            if (
+                torch.cuda.get_device_capability(input.device)[0] != 9
+                or input.data_ptr() % 32
+            ):
+                from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+                    per_token_group_quant_8bit_v2,
+                )
+
+                per_token_group_quant_8bit_v2(
+                    input,
+                    output_q,
+                    output_s,
+                    group_size,
+                    scale_ue8m0=True,
+                )
+                return
+        elif input.data_ptr() % 32 or input.dtype == torch.float16:
+            # v2 only writes unpacked FP32 UE8M0 scales in row-major order;
+            # quantize row-major and copy into the caller's strided view.
             from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
                 per_token_group_quant_8bit_v2,
             )
 
+            row_s = torch.empty(
+                output_s.shape, device=output_s.device, dtype=torch.float32
+            )
             per_token_group_quant_8bit_v2(
                 input,
                 output_q,
-                output_s,
+                row_s,
                 group_size,
                 scale_ue8m0=True,
             )
+            output_s.copy_(row_s)
             return
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)

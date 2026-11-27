@@ -268,6 +268,59 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
                         out = linear(x, weight[:n], [128, 128], weight_scale)
                         torch.testing.assert_close(out, ref[:, :n], rtol=0, atol=0)
 
+    @unittest.skipUnless(
+        get_device_sm() == 90, "SM90 UE8M0 TMA-aligned activation scales"
+    )
+    def test_deep_gemm_ue8m0_scales_skip_tma_transpose(self):
+        """SM90 DeepGEMM UE8M0 activation quant must already be MN-major TMA-aligned."""
+        torch.manual_seed(11)
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        orig_matmul = fp8_utils.w8a8_block_fp8_matmul_deepgemm
+        seen_scales = []
+
+        def spy_matmul(A, B, As, Bs, block_size, output_dtype, output=None):
+            seen_scales.append((block_size, As))
+            return orig_matmul(A, B, As, Bs, block_size, output_dtype, output=output)
+
+        for block_size, m, n, k in (
+            ([32, 32], 5, 128, 288),
+            ([32, 32], 1, 512, 512),
+            ([128, 128], 5, 128, 512),
+            ([128, 128], 1, 256, 512),
+        ):
+            with self.subTest(block_size=block_size, m=m, n=n, k=k):
+                x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 4
+                w = (torch.randn(n, k, device="cuda") / 4).to(torch.float8_e4m3fn)
+                ws = torch.pow(
+                    2.0,
+                    torch.randint(
+                        -4, 2, (n // block_size[0], k // block_size[1]), device="cuda"
+                    ).float(),
+                )
+                q_row, s_row = fp8_utils.sglang_per_token_group_quant_fp8(
+                    x, block_size[1], scale_ue8m0=True
+                )
+                ref = orig_matmul(
+                    q_row, w, s_row, ws, block_size, output_dtype=torch.bfloat16
+                )
+                seen_scales.clear()
+                with mock.patch.object(
+                    fp8_utils, "w8a8_block_fp8_matmul_deepgemm", side_effect=spy_matmul
+                ):
+                    out = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                        x, w, block_size, ws, act_scale_ue8m0=True
+                    )
+                self.assertEqual(len(seen_scales), 1)
+                _, x_scale = seen_scales[0]
+                aligned_m = (m + 3) // 4 * 4
+                self.assertEqual(x_scale.dtype, torch.float32)
+                self.assertEqual(x_scale.stride(), (1, aligned_m))
+                # Zero-copy fast path: DeepGEMM returns the same storage without transpose.
+                aligned = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(x_scale)
+                self.assertEqual(aligned.data_ptr(), x_scale.data_ptr())
+                torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
     def test_flashinfer_trtllm(self):
         self._run("flashinfer_trtllm")
 

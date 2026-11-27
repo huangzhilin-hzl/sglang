@@ -506,32 +506,31 @@ def create_per_token_group_quant_fp8_output_scale(
     column_major_scales: bool,
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
+    scale_packed: Optional[bool] = None,
 ):
-    if scale_ue8m0:
-        if column_major_scales and scale_tma_aligned:
-            *x_batch, x_q_mn, x_q_k = x_shape
-            x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
-            aligned_mn = ceil_align(x_s_mn, 4)
-            aligned_k = ceil_align(x_s_k, 4)
-            # TODO(FIXME): Fix cuda kernel and recover here to empty.
-            return torch.empty(
-                (*x_batch, aligned_k // 4, aligned_mn),
-                device=device,
-                dtype=torch.int,
-            ).transpose(-1, -2)[..., :x_s_mn, :]
-        else:
-            assert not column_major_scales, (
-                "column_major_scales requires scale_tma_aligned=True "
-                "when scale_ue8m0 is enabled"
-            )
-            # Row-major UE8M0 keeps the scale as float32 power-of-two values,
-            # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
-            return torch.empty(
-                x_shape[:-1] + (x_shape[-1] // group_size,),
-                device=device,
-                dtype=torch.float32,
-            )
-    elif column_major_scales:
+    if scale_packed is None:
+        scale_packed = scale_ue8m0 and column_major_scales and scale_tma_aligned
+    if scale_packed:
+        assert scale_ue8m0 and column_major_scales and scale_tma_aligned, (
+            "scale_packed=True requires scale_ue8m0, column_major_scales, "
+            "and scale_tma_aligned"
+        )
+        *x_batch, x_q_mn, x_q_k = x_shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
+        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_k = ceil_align(x_s_k, 4)
+        # TODO(FIXME): Fix cuda kernel and recover here to empty.
+        return torch.empty(
+            (*x_batch, aligned_k // 4, aligned_mn),
+            device=device,
+            dtype=torch.int,
+        ).transpose(-1, -2)[..., :x_s_mn, :]
+    if scale_ue8m0 and column_major_scales and not scale_tma_aligned:
+        raise AssertionError(
+            "column_major_scales requires scale_tma_aligned=True "
+            "when scale_ue8m0 is enabled"
+        )
+    if column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
             # aligned to 4 * sizeof(float)
@@ -563,6 +562,15 @@ _MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
 _V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
 
+def _is_col_major_2d_fp32_scale(x_s: torch.Tensor) -> bool:
+    return (
+        x_s.dtype == torch.float32
+        and x_s.ndim == 2
+        and x_s.stride(0) == 1
+        and x_s.stride(1) >= x_s.shape[0]
+    )
+
+
 def _run_per_token_group_quant_8bit_kernel(
     x: torch.Tensor,
     x_q: torch.Tensor,
@@ -578,7 +586,9 @@ def _run_per_token_group_quant_8bit_kernel(
 
     CUDA uses JIT kernels with a fixed absmax floor and dtype-derived range.
     The trait kernel handles FP32 power-of-two scales for flat BF16 group32
-    on Hopper; other FP32 power-of-two cases use v2. MUSA keeps the AOT op.
+    row-major scales on Hopper and flat BF16 column-major scales across
+    supported group sizes; other FP32 power-of-two cases use v2. MUSA keeps
+    the AOT op.
     """
     if _is_musa:
         sgl_per_token_group_quant_8bit(
@@ -596,33 +606,50 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    if (
-        scale_ue8m0
-        and x_s.dtype == torch.float32
-        and not (
-            x.dtype == torch.bfloat16
-            and x.ndim == 2
-            and x_s.is_contiguous()
-            and x_q.dtype == fp8_dtype
-            and group_size == 32
-            and eps == 1e-10
-            and not fuse_silu_and_mul
-            and masked_m is None
+    use_trait_fp32_pow2 = (
+        x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x_q.dtype == fp8_dtype
+        and eps == 1e-10
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and (
+            (x_s.is_contiguous() and group_size == 32)
+            or (
+                _is_col_major_2d_fp32_scale(x_s)
+                and group_size in _V3_KERNEL_SUPPORTED_GROUP_SIZES
+            )
         )
-    ):
+    )
+    if scale_ue8m0 and x_s.dtype == torch.float32 and not use_trait_fp32_pow2:
         from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )
 
-        per_token_group_quant_8bit_v2(
-            input=x,
-            output_q=x_q,
-            output_s=x_s,
-            group_size=group_size,
-            scale_ue8m0=scale_ue8m0,
-            fuse_silu_and_mul=fuse_silu_and_mul,
-            masked_m=masked_m,
-        )
+        # v2 packs column-major UE8M0 scales as uint8-in-int32, so a non-contiguous
+        # FP32 scale view must quantize row-major first and copy into place.
+        if not x_s.is_contiguous():
+            row_s = torch.empty(x_s.shape, device=x_s.device, dtype=torch.float32)
+            per_token_group_quant_8bit_v2(
+                input=x,
+                output_q=x_q,
+                output_s=row_s,
+                group_size=group_size,
+                scale_ue8m0=scale_ue8m0,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=masked_m,
+            )
+            x_s.copy_(row_s)
+        else:
+            per_token_group_quant_8bit_v2(
+                input=x,
+                output_q=x_q,
+                output_s=x_s,
+                group_size=group_size,
+                scale_ue8m0=scale_ue8m0,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=masked_m,
+            )
         return
 
     assert eps == 1e-10, (
@@ -649,6 +676,7 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     *,
+    scale_packed: Optional[bool] = None,
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
 ):
@@ -693,6 +721,7 @@ def sglang_per_token_group_quant_fp8(
             column_major_scales=column_major_scales,
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
+            scale_packed=scale_packed,
         )
     )
 
