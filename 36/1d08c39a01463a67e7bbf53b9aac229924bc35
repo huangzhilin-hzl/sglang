@@ -1,0 +1,24 @@
+test/registered/kernels/ops/gemm/test_fp8_block32_sm90.py
+  h_65d95dfcbf63bf 1-239
+python/sglang/kernels/ops/gemm/fp8_block32_sm90.py
+  h_65d95dfcbf63bf 1-715
+test/registered/unit/kernels/test_fp8_block32_sm90_dispatch.py
+  h_65d95dfcbf63bf 1-352,354-380,382-390,392-397
+  h_65d95dfcbf63bf 353,381,391
+python/sglang/kernels/ops/gemm/fp8_kernel.py
+  h_65d95dfcbf63bf 11-14,630-634,636-649,664
+  h_65d95dfcbf63bf 635
+python/sglang/kernels/ops/gemm/__init__.py
+  h_65d95dfcbf63bf 675-682
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "361d08c39a01463a67e7bbf53b9aac229924bc35",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
