@@ -1,0 +1,28 @@
+python/sglang/kernels/ops/gemm/__init__.py
+  h_65d95dfcbf63bf 675-682
+python/sglang/kernels/ops/gemm/fp8_kernel.py
+  h_65d95dfcbf63bf 11-12,14-15,631-648,653-655,670
+  h_65d95dfcbf63bf 13,649-652
+python/sglang/kernels/ops/gemm/fp8_block32_sm90.py
+  h_65d95dfcbf63bf 1-32,34-43,45-167,170-219,222-419,426-427,456-611,614,616-637,639-667,670,672-694,696-723,725-726,728-806
+  h_65d95dfcbf63bf 33,44,168-169,220-221,420-425,428-455,612-613,615,638,668-669,671,695,724,727
+test/registered/kernels/ops/gemm/test_fp8_block32_sm90.py
+  h_65d95dfcbf63bf 1-11,13-236,321-324
+  h_65d95dfcbf63bf 12,237-320
+test/registered/unit/kernels/test_fp8_block32_sm90_dispatch.py
+  h_65d95dfcbf63bf 1-445,447-462,529-532,534-562,611-614
+  h_65d95dfcbf63bf 446,463-528,533,563-610
+python/sglang/srt/layers/quantization/fp8_utils.py
+  h_65d95dfcbf63bf 11-16,1856-1915,1966-1982
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "928b29473e2bc256899c1b4ce0493402cec57c37",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
