@@ -8,6 +8,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
+    _fp8_block32_sm90_gemm_unchecked,
+    is_h20_sm90,
+    use_fp8_block32_sm90_gemm,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.runtime_context import get_context, get_exec, get_platform
 from sglang.srt.utils import (
@@ -623,6 +628,31 @@ def w8a8_block_fp8_matmul_triton(
         torch.Tensor: The result of matmul.
     """
 
+    # Standalone callers (tools, unit tests) have no published exec namespace
+    # and are not running deterministic inference: default off.
+    context = get_context()
+    deterministic = (
+        context.is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+    # On H20, always route eligible block-32x32 BF16 matmuls directly to the
+    # SM90 kernel family before prepare_block_fp8_matmul_inputs (faster than
+    # both tuned H20 JSON configs and the generic fallback). On other SM90 SKUs
+    # (e.g. H100/H200), preserve existing per-shape tuned JSON configs and use
+    # this kernel family for shapes without a tuned config. Deterministic
+    # inference stays on the single-accumulator path so reduction order is
+    # independent of M.
+    if (
+        not deterministic
+        and use_fp8_block32_sm90_gemm(A, B, As, Bs, block_size, output_dtype)
+        and (
+            is_h20_sm90()
+            or get_w8a8_block_fp8_configs(B.shape[0], B.shape[1], 32, 32) is None
+        )
+    ):
+        return _fp8_block32_sm90_gemm_unchecked(A, B, As, Bs)
+
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     block_n, block_k = block_size
@@ -637,12 +667,7 @@ def w8a8_block_fp8_matmul_triton(
         # different batch sizes. Deterministic inference promises batch
         # invariant ops, so drop these meta-parameters instead of passing
         # disabled values that the single-accumulator kernels do not accept.
-        # Standalone callers (tools, unit tests) have no published exec
-        # namespace and are not running deterministic inference: default off.
-        context = get_context()
-        if context.is_config_namespace_published("exec") and (
-            get_exec().deterministic.enable_deterministic_inference
-        ):
+        if deterministic:
             config = {
                 key: value
                 for key, value in config.items()

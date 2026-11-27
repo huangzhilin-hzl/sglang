@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
+    _fp8_block32_sm90_gemm_unchecked,
+    is_h20_sm90,
+    prefers_fp8_block32_sm90_over_deepgemm,
+    use_fp8_block32_sm90_gemm,
+)
 from sglang.kernels.ops.gemm.fp8_kernel import (
     get_w8a8_channelwise_fp8_config,
     triton_scaled_mm,
@@ -1847,6 +1853,66 @@ def _deepgemm_packed_input_valid(input, weight, input_scale, weight_scale) -> bo
     )
 
 
+def _is_block32_hybrid_opt_out() -> bool:
+    from sglang.srt.layers.quantization.mxfp8_input import (
+        batch_invariant_or_deterministic,
+    )
+
+    try:
+        return batch_invariant_or_deterministic()
+    except ValueError:
+        return False
+
+
+def _use_fp8_block32_sm90_hybrid(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype,
+    input_scale: Optional[torch.Tensor],
+) -> bool:
+    if not (
+        len(block_size) == 2
+        and block_size[0] == 32
+        and block_size[1] == 32
+        and output_dtype == torch.bfloat16
+        and weight.ndim == 2
+        and is_h20_sm90()
+        and prefers_fp8_block32_sm90_over_deepgemm(
+            input_2d.shape[0], weight.shape[0], weight.shape[1]
+        )
+    ):
+        return False
+    if _is_block32_hybrid_opt_out():
+        return False
+    if input_scale is not None:
+        return use_fp8_block32_sm90_gemm(
+            input_2d, weight, input_scale, weight_scale, block_size, output_dtype
+        )
+    n, k = weight.shape
+    return (
+        input_2d.is_cuda
+        and input_2d.dtype == torch.bfloat16
+        and input_2d.is_contiguous()
+        and weight.is_cuda
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.is_contiguous()
+        and weight_scale.is_cuda
+        and weight_scale.dtype == torch.float32
+        and input_2d.device == weight.device == weight_scale.device
+        and input_2d.shape[1] == k
+        and k > 0
+        and k % 32 == 0
+        and n > 0
+        and n % 64 == 0
+        and weight_scale.ndim == 2
+        and weight_scale.shape == (n // 32, k // 32)
+        and weight_scale.stride(0) >= 0
+        and (weight_scale.stride(1) == 1 or weight_scale.shape[1] == 1)
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1896,6 +1962,23 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         result = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
         if bias is not None:
             result += bias
+        return _finish(result.view(*input.shape[:-1], weight.shape[0]))
+    if _use_fp8_block32_sm90_hybrid(
+        input_2d, weight, weight_scale, block_size, output_dtype, input_scale
+    ):
+        if input_scale is None:
+            q_input, x_scale = sglang_per_token_group_quant_fp8(
+                input_2d, 32, scale_ue8m0=act_scale_ue8m0
+            )
+        else:
+            q_input, x_scale = input_2d, input_scale
+        result = _fp8_block32_sm90_gemm_unchecked(
+            q_input, weight, x_scale, weight_scale, out=gemm_out
+        )
+        if bias is not None:
+            result += bias
+        if direct:
+            return output
         return _finish(result.view(*input.shape[:-1], weight.shape[0]))
 
     # DeepGEMM accepts a partial final K block when both operands carry ceil(K / 128)
